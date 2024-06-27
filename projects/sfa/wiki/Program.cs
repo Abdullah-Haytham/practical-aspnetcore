@@ -45,8 +45,9 @@ app.UseStaticFiles();
 app.UseAuthorization();
 
 // Load home page
-app.MapGet("/", (Wiki wiki, Render render) =>
+app.MapGet("/", (HttpContext context, Wiki wiki, Render render) =>
 {
+    var isLogged = isLoggedIn(context);
     Page? page = wiki.GetPage(HomePageName);
 
     if (page is not object)
@@ -57,9 +58,10 @@ app.MapGet("/", (Wiki wiki, Render render) =>
         {
           RenderPageContent(page),
           RenderPageAttachments(page),
-          A.Href($"/edit?pageName={HomePageName}").Class("uk-button uk-button-default uk-button-small").Append("Edit").ToHtmlString()
+          isLogged ? A.Href($"/edit?pageName={HomePageName}").Class("uk-button uk-button-default uk-button-small").Append("Edit").ToHtmlString() : ""
         },
-        atSidePanel: () => AllPages(wiki)
+        atSidePanel: () => AllPages(wiki),
+        isLoggedIn: isLogged
       ).ToString(), HtmlMime);
 });
 
@@ -84,10 +86,16 @@ app.MapGet("/auth/register", (Render render, HttpContext context, IAntiforgery a
     ).ToString(), HtmlMime);
 });
 
-app.MapGet("/new-page", (string? pageName) =>
+app.MapGet("/new-page", (string? pageName, HttpContext context) =>
 {
+    var isLogged = isLoggedIn(context);
+    if (!isLogged)
+    {
+        return Results.BadRequest("Access Denied. Please Login to use this feature");
+    }
+
     if (string.IsNullOrEmpty(pageName))
-        Results.Redirect("/");
+        return Results.Redirect("/");
 
     // Copied from https://www.30secondsofcode.org/c-sharp/s/to-kebab-case
     string ToKebabCase(string str)
@@ -103,6 +111,12 @@ app.MapGet("/new-page", (string? pageName) =>
 // Edit a wiki page
 app.MapGet("/edit", (string pageName, HttpContext context, Wiki wiki, Render render, IAntiforgery antiForgery) =>
 {
+    var isLogged = isLoggedIn(context);
+    if (!isLogged)
+    {
+        return Results.BadRequest("Access Denied. Please Login to use this feature");
+    }
+
     Page? page = wiki.GetPage(pageName);
     if (page is not object)
         return Results.NotFound();
@@ -142,6 +156,7 @@ app.MapGet("/attachment", (string fileId, Wiki wiki) =>
 // Load a wiki page
 app.MapGet("/{pageName}", (string pageName, HttpContext context, Wiki wiki, Render render, IAntiforgery antiForgery) =>
 {
+    var isLogged = isLoggedIn(context);
     pageName = pageName ?? "";
 
     Page? page = wiki.GetPage(pageName);
@@ -154,9 +169,11 @@ app.MapGet("/{pageName}", (string pageName, HttpContext context, Wiki wiki, Rend
             RenderPageContent(page),
             RenderPageAttachments(page),
             Div.Class("last-modified").Append("Last modified: " + page!.LastModifiedUtc.ToString(DisplayDateFormat)).ToHtmlString(),
-            A.Href($"/edit?pageName={pageName}").Append("Edit").ToHtmlString()
+            isLogged ? A.Href($"/edit?pageName={pageName}").Append("Edit").ToHtmlString() : ""
+            //RenderPageComments(page)?
           },
-          atSidePanel: () => AllPages(wiki)
+          atSidePanel: () => AllPages(wiki),
+          isLoggedIn: isLogged
         ).ToString(), HtmlMime);
     }
     else
@@ -338,6 +355,18 @@ app.MapPost("/auth/register", async (Wiki wiki, HttpContext context, Render rend
     {
         return Results.Redirect("/auth/login");
     }
+});
+
+app.MapPost("/auth/logout", async (HttpContext context) =>
+{
+    await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+
+    var referrer = context.Request.Headers["Referer"].ToString();
+    if (!string.IsNullOrEmpty(referrer))
+    {
+        return Results.Redirect(referrer);
+    }
+    return Results.Redirect("/");
 });
 
 await app.RunAsync();
@@ -634,6 +663,10 @@ static string BuildAuthForm(bool isLogin, AntiforgeryTokenSet antiForgery, Model
 
     
 }
+static bool isLoggedIn(HttpContext context)
+{
+    return context.User.Identity?.IsAuthenticated ?? false;
+}
 class Render
 {
     static string KebabToNormalCase(string txt) => CultureInfo.CurrentCulture.TextInfo.ToTitleCase(txt.Replace('-', ' '));
@@ -710,6 +743,7 @@ class Render
                           <li class="uk-active"><a href="/"><span uk-icon="home"></span></a></li>
                         </ul>
                       </div>
+                      {{ if is_logged_in == true }}
                       <div class="uk-navbar-center">
                         <div class="uk-navbar-item">
                           <form action="/new-page">
@@ -718,6 +752,24 @@ class Render
                           </form>
                         </div>
                       </div>
+
+                      <div class="uk-navbar-right">
+                        <div class="uk-navbar-item">
+                            <form method="post" action="/auth/logout">
+                                <input type="submit" class="uk-button uk-button-primary" value="Logout">
+                            </form>
+                        </div>
+                      </div>
+                      {{ else }}
+                        <div class="uk-navbar-right">
+                            <div class="uk-navbar-item">
+                                <a style="color: white;" href="/auth/login" class="uk-button uk-button-primary">Login</a>
+                            </div>
+                            <div class="uk-navbar-item">
+                                <a style="color: white;" href="/auth/register" class="uk-button uk-button-primary">Register</a>
+                            </div>
+                      </div>
+                      {{ end }}
                     </div>
                   </div>
                 </nav>
@@ -772,11 +824,12 @@ class Render
         atHead: () => MarkdownEditorHead(),
         atBody: atBody,
         atSidePanel: atSidePanel,
-        atFoot: () => MarkdownEditorFoot()
+        atFoot: () => MarkdownEditorFoot(),
+        isLoggedIn: true
         );
 
     // General page layout building function
-    public HtmlString BuildPage(string title, Func<IEnumerable<string>>? atHead = null, Func<IEnumerable<string>>? atBody = null, Func<IEnumerable<string>>? atSidePanel = null, Func<IEnumerable<string>>? atFoot = null)
+    public HtmlString BuildPage(string title, Func<IEnumerable<string>>? atHead = null, Func<IEnumerable<string>>? atBody = null, Func<IEnumerable<string>>? atSidePanel = null, Func<IEnumerable<string>>? atFoot = null, bool isLoggedIn = false)
     {
         var head = _templates.head.Render(new
         {
@@ -800,7 +853,8 @@ class Render
                 PageName = KebabToNormalCase(title),
                 Content = string.Join("\r", atBody?.Invoke() ?? new[] { "" }),
                 AtSidePanel = string.Join("\r", atSidePanel?.Invoke() ?? new[] { "" }),
-                AtFoot = string.Join("\r", atFoot?.Invoke() ?? new[] { "" })
+                AtFoot = string.Join("\r", atFoot?.Invoke() ?? new[] { "" }),
+                IsLoggedIn = isLoggedIn
             });
 
             return new HtmlString(_templates.layout.Render(new { head, body }));
