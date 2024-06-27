@@ -5,17 +5,23 @@ using HtmlBuilders;
 using LiteDB;
 using Markdig;
 using Microsoft.AspNetCore.Antiforgery;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Html;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
+using Microsoft.AspNetCore.Mvc.RazorPages;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Primitives;
 using Scriban;
 using System.Globalization;
+using System.Security.Claims;
 using System.Text.RegularExpressions;
 using static HtmlBuilders.HtmlTags;
 
 const string DisplayDateFormat = "MMMM dd, yyyy";
 const string HomePageName = "home-page";
+const string LogInPageName = "login-page";
+const string RegisterPageName = "register-page";
 const string HtmlMime = "text/html";
 
 var builder = WebApplication.CreateBuilder();
@@ -23,11 +29,20 @@ builder.Services
   .AddSingleton<Wiki>()
   .AddSingleton<Render>()
   .AddAntiforgery()
-  .AddMemoryCache();
+  .AddAuthorization()
+  .AddMemoryCache()
+  .AddAuthentication(options =>
+  {
+      options.DefaultAuthenticateScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+      options.DefaultChallengeScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+  }).AddCookie();
 
 builder.Logging.AddConsole().SetMinimumLevel(LogLevel.Warning);
 
 var app = builder.Build();
+
+app.UseStaticFiles();
+app.UseAuthorization();
 
 // Load home page
 app.MapGet("/", (Wiki wiki, Render render) =>
@@ -46,6 +61,27 @@ app.MapGet("/", (Wiki wiki, Render render) =>
         },
         atSidePanel: () => AllPages(wiki)
       ).ToString(), HtmlMime);
+});
+
+// Load login page
+app.MapGet("/auth/login", (Render render, HttpContext context, IAntiforgery antiForgery) =>
+{
+    var stop = "";
+    return Results.Text(render.BuildPage(LogInPageName, atBody: () => new[]
+    {
+        BuildAuthForm(true, antiForgery.GetAndStoreTokens(context))
+    }
+    ).ToString(), HtmlMime);   
+});
+
+app.MapGet("/auth/register", (Render render, HttpContext context, IAntiforgery antiForgery) =>
+{
+    var stop = "";
+    return Results.Text(render.BuildPage(RegisterPageName, atBody: () => new[]
+    {
+        BuildAuthForm(false, antiForgery.GetAndStoreTokens(context))
+    }
+    ).ToString(), HtmlMime);
 });
 
 app.MapGet("/new-page", (string? pageName) =>
@@ -220,10 +256,88 @@ app.MapPost("/{pageName}", async (HttpContext context, Wiki wiki, Render render,
     if (!isOk)
     {
         app.Logger.LogError(ex, "Problem in saving page");
-        return Results.Problem("Progblem in saving page");
+        return Results.Problem("Problem in saving page");
     }
 
     return Results.Redirect($"/{p!.Name}");
+});
+
+app.MapPost("/auth/login", async (Wiki wiki, HttpContext context, Render render, IAntiforgery antiForgery) =>
+{
+    await antiForgery.ValidateRequestAsync(context);
+
+    LoginInput input = LoginInput.From(context.Request.Form);
+
+    var modelState = new ModelStateDictionary();
+    var validator = new LoginInputValidator();
+    validator.Validate(input).AddToModelState(modelState, null);
+
+    if (!modelState.IsValid) 
+    {
+        return Results.Text(render.BuildPage(LogInPageName, atBody: () => new[]
+        {
+            BuildAuthForm(true, antiForgery.GetAndStoreTokens(context), modelState, login: input)
+        }
+        ).ToString(), HtmlMime);
+    }
+
+    var (isOk, user, ex) = wiki.CanLogin(input);
+    if (!isOk)
+    {
+        return Results.Text(render.BuildPage(LogInPageName, atBody: () => new[]
+        {
+            BuildAuthForm(true, antiForgery.GetAndStoreTokens(context), modelState, login: input, err: ex.Message)
+        }
+        ).ToString(), HtmlMime);
+    }
+    else
+    {
+        var claims = new List<Claim>
+        {
+            new Claim(ClaimTypes.Name, user!.Name)
+        };
+        var claimsIdentity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+        var authProperties = new AuthenticationProperties
+        {
+            IsPersistent = true
+        };
+        await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(claimsIdentity), authProperties);
+        return Results.Redirect("/");
+    }
+});
+
+app.MapPost("/auth/register", async (Wiki wiki, HttpContext context, Render render, IAntiforgery antiForgery) =>
+{
+    await antiForgery.ValidateRequestAsync(context);
+
+    RegisterInput input = RegisterInput.From(context.Request.Form);
+
+    var modelState = new ModelStateDictionary();
+    var validator = new RegisterInputValidator();
+    validator.Validate(input).AddToModelState(modelState, null);
+
+    if (!modelState.IsValid)
+    {
+        return Results.Text(render.BuildPage(RegisterPageName, atBody: () => new[]
+        {
+            BuildAuthForm(false, antiForgery.GetAndStoreTokens(context), modelState, register: input)
+        }
+        ).ToString(), HtmlMime);
+    }
+
+    var (isOk, ex) = wiki.RegisterUser(input);
+    if (!isOk)
+    {
+        return Results.Text(render.BuildPage(RegisterPageName, atBody: () => new[]
+        {
+            BuildAuthForm(false, antiForgery.GetAndStoreTokens(context), modelState, register: input, err: ex.Message)
+        }
+        ).ToString(), HtmlMime);
+    }
+    else
+    {
+        return Results.Redirect("/auth/login");
+    }
 });
 
 await app.RunAsync();
@@ -416,6 +530,110 @@ static string BuildForm(PageInput input, string path, AntiforgeryTokenSet antiFo
     return form.ToHtmlString();
 }
 
+static string BuildAuthForm(bool isLogin, AntiforgeryTokenSet antiForgery, ModelStateDictionary? modelState = null, LoginInput? login = null, RegisterInput? register = null, string err = "")
+{
+    bool IsFieldOK(string key) => modelState!.ContainsKey(key) && modelState[key]!.ValidationState == ModelValidationState.Invalid;
+
+    string path = isLogin ? "login" : "register";
+    string name = "";
+    string password = "";
+    string confirmPassword = "";
+
+    if(login != null)
+    {
+        name = login.Name;
+        password = login.Password;
+    }
+    if (register != null)
+    {
+        name = register.Name;
+        password = register.Password;
+        confirmPassword = register.ConfirmPassword;
+    }
+
+    var antiForgeryField = Input.Hidden.Name(antiForgery.FormFieldName).Value(antiForgery.RequestToken!);
+
+    var nameField = Div
+      .Append(Label.Class("uk-form-label").Append("Username"))
+      .Append(Div.Class("uk-form-controls")
+        .Append(Input.Text.Class("uk-input").Name("username").Attribute("placeholder ", "Username").Style("margin-bottom", "8px").Value(name))
+      );
+
+    var passwordField = Div
+      .Append(Label.Class("uk-form-label").Append("Password"))
+      .Append(Div.Class("uk-form-controls")
+        .Append(Input.Text.Class("uk-input").Name("password").Attribute("placeholder ", "Password").Attribute("type", "password").Style("margin-bottom", "8px").Value(password))
+      );    
+
+    var confirmPasswordField = Div
+      .Append(Label.Class("uk-form-label").Append("Confirm Password"))
+      .Append(Div.Class("uk-form-controls")
+        .Append(Input.Text.Class("uk-input").Name("confirmPassword").Attribute("placeholder ", "Confirm Password").Attribute("type", "password").Value(confirmPassword))
+      );
+
+    var problemMessage = Div.Class("uk-form-danger uk-text-small").Append(err);
+
+    if (modelState is object && !modelState.IsValid)
+    {
+        if (IsFieldOK("Name"))
+        {
+            foreach (var er in modelState["Name"]!.Errors)
+            {
+                nameField = nameField.Append(Div.Class("uk-form-danger uk-text-small").Append(er.ErrorMessage));
+            }
+        }
+
+        if (IsFieldOK("Password"))
+        {
+            foreach (var er in modelState["Password"]!.Errors)
+            {
+                passwordField = passwordField.Append(Div.Class("uk-form-danger uk-text-small").Append(er.ErrorMessage));
+            }
+        }
+
+        if (IsFieldOK("ConfirmPassword") && !isLogin)
+        {
+            foreach (var er in modelState["ConfirmPassword"]!.Errors)
+            {
+                confirmPasswordField = confirmPasswordField.Append(Div.Class("uk-form-danger uk-text-small").Append(er.ErrorMessage));
+            }
+        }
+    }
+
+    if (isLogin)
+    {
+        var submit = Div.Style("margin-top", "20px").Append(Button.Class("uk-button uk-button-primary").Append("Login"));
+        var form = Form
+               .Class("uk-form-stacked login-card")
+               .Attribute("method", "post")
+               .Attribute("action", $"/auth/{path}")
+                 .Append(H1.Append("Login"))
+                 .Append(antiForgeryField)
+                 .Append(nameField)
+                 .Append(passwordField)
+                 .Append(submit)
+                 .Append(problemMessage);
+        return form.ToHtmlString();
+    }
+    else
+    {
+        var submit = Div.Style("margin-top", "20px").Append(Button.Class("uk-button uk-button-primary").Append("Register"));
+        var form = Form
+           .Class("uk-form-stacked login-card")
+           .Attribute("method", "post")
+           .Attribute("action", $"/auth/{path}")
+             .Append(H1.Append("Register"))
+             .Append(antiForgeryField)
+             .Append(nameField)
+             .Append(passwordField)
+             .Append(confirmPasswordField)
+             .Append(submit)
+             .Append(problemMessage);
+        return form.ToHtmlString();
+    }
+
+    
+}
 class Render
 {
     static string KebabToNormalCase(string txt) => CultureInfo.CurrentCulture.TextInfo.ToTitleCase(txt.Replace('-', ' '));
@@ -442,18 +660,45 @@ class Render
         </script>"
     };
 
-    (Template head, Template body, Template layout) _templates = (
+    (Template head, Template body, Template authBody,Template layout) _templates = (
       head: Scriban.Template.Parse(
         """
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
           <title>{{ title }}</title>
           <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uikit@3.19.4/dist/css/uikit.min.css" />
+          <link rel="stylesheet" href="styles.css">
+          <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"
+          integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+
+          <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.9.2/dist/umd/popper.min.js"
+              integrity="sha384-IQsoLXl5PILFhosVNubq5LC7Qb9DXgDA9i+tQ8Zj3iwWAwPtgFTxbJ8NT4GN1R8p"
+              crossorigin="anonymous"></script>
+          <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.min.js"
+              integrity="sha384-cVKIPhGWiC2Al4u+LWgxfKTRIcfu0JTxR+EQDz/bgldoEyl4H0zUF0QKbrJ0EcQF"
+              crossorigin="anonymous"></script>
+
           {{ header }}
           <style>
             .last-modified { font-size: small; }
             a:visited { color: blue; }
             a:link { color: red; }
+            .login-container {
+              display: flex;
+              justify-content: center;
+              align-items: center;
+              height: 100vh;
+          }
+          .login-card{
+            border: 1px solid lightgray;
+            border-radius: 10px;
+            display: flex;
+            flex-direction: column;
+            width: 500px;
+            max-width: 90%;
+            padding: 1rem;
+            box-shadow: 0 8px 16px 0 rgba(0,0,0,0.3);
+          }
           </style>
           """),
       body: Scriban.Template.Parse("""
@@ -500,6 +745,14 @@ class Render
                 {{ at_foot }}
                 
           """),
+        authBody: Scriban.Template.Parse("""
+                <main class="login-container">
+                  {{content}}
+                 </main>
+                <script src="https://cdn.jsdelivr.net/npm/uikit@3.19.4/dist/js/uikit.min.js"></script>
+                <script src="https://cdn.jsdelivr.net/npm/uikit@3.19.4/dist/js/uikit-icons.min.js"></script>
+                
+          """),
       layout: Scriban.Template.Parse("""
                 <!DOCTYPE html>
                   <head>
@@ -531,15 +784,27 @@ class Render
             header = string.Join("\r", atHead?.Invoke() ?? new[] { "" })
         });
 
-        var body = _templates.body.Render(new
+        if(title == "login-page" || title == "register-page")
         {
-            PageName = KebabToNormalCase(title),
-            Content = string.Join("\r", atBody?.Invoke() ?? new[] { "" }),
-            AtSidePanel = string.Join("\r", atSidePanel?.Invoke() ?? new[] { "" }),
-            AtFoot = string.Join("\r", atFoot?.Invoke() ?? new[] { "" })
-        });
+            var body = _templates.authBody.Render(new
+            {
+                Content = string.Join("\r", atBody?.Invoke() ?? new[] { "" }),
+            });
 
-        return new HtmlString(_templates.layout.Render(new { head, body }));
+            return new HtmlString(_templates.layout.Render(new { head, body }));
+        }
+        else
+        {
+            var body = _templates.body.Render(new
+            {
+                PageName = KebabToNormalCase(title),
+                Content = string.Join("\r", atBody?.Invoke() ?? new[] { "" }),
+                AtSidePanel = string.Join("\r", atSidePanel?.Invoke() ?? new[] { "" }),
+                AtFoot = string.Join("\r", atFoot?.Invoke() ?? new[] { "" })
+            });
+
+            return new HtmlString(_templates.layout.Render(new { head, body }));
+        }
     }
 }
 
@@ -548,6 +813,7 @@ class Wiki
     DateTime Timestamp() => DateTime.UtcNow;
 
     const string PageCollectionName = "Pages";
+    const string UserCollectionName = "Users";
     const string AllPagesKey = "AllPages";
     const double CacheAllPagesForMinutes = 30;
 
@@ -718,7 +984,7 @@ class Wiki
 
             if (page.Name.Equals(homePageName, StringComparison.OrdinalIgnoreCase))
             {
-                _logger.LogWarning($"Page id {id}  is a home page and elete operation on home page is not allowed");
+                _logger.LogWarning($"Page id {id}  is a home page and delete operation on home page is not allowed");
                 return (false, null);
             }
 
@@ -756,6 +1022,60 @@ class Wiki
         db.FileStorage.Download(fileId, stream);
         return (meta, stream.ToArray());
     }
+
+    public (bool isOk, User? user, Exception? ex) CanLogin(LoginInput input)
+    {
+        try
+        {
+            using var db = new LiteDatabase(GetDbPath());
+            var coll = db.GetCollection<User>(UserCollectionName);
+            coll.EnsureIndex(x => x.Name);
+
+            var user = coll.FindOne(x => x.Name == input.Name);
+
+            if (user is null)
+            {
+                return (false, null, new Exception("No user exists with this name"));
+            }
+            else if (user.Password != input.Password)
+            {
+                return (false, null, new Exception("Wrong password"));
+            }
+            return (true, user, null);
+        }
+        catch (Exception ex) 
+        {
+            return (false, null, ex);
+        }
+    }
+
+    public (bool isOk, Exception? ex) RegisterUser(RegisterInput input)
+    {
+        try
+        {
+            using var db = new LiteDatabase(GetDbPath());
+            var coll = db.GetCollection<User>(UserCollectionName);
+            coll.EnsureIndex(x => x.Name);
+
+            if(coll.Exists(x=> x.Name == input.Name))
+            {
+                return (false, new Exception("Username is Taken"));
+            }
+
+            var user = new User
+            {
+                Name = input.Name,
+                Password = input.Password
+            };
+
+            coll.Insert(user);
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, ex);
+        }
+    }
 }
 
 record Page
@@ -769,6 +1089,16 @@ record Page
     public DateTime LastModifiedUtc { get; set; }
 
     public List<Attachment> Attachments { get; set; } = new();
+}
+
+record User
+{
+    public int Id { get; set; }
+
+    public string Name { get; set; } = string.Empty;
+
+    public string Password { get; set; } = string.Empty;
+
 }
 
 record Attachment
@@ -799,6 +1129,24 @@ record PageInput(int? Id, string Name, string Content, IFormFile? Attachment)
     }
 }
 
+record LoginInput(string Name, string Password)
+{
+    public static LoginInput From(IFormCollection form)
+    {
+        var (username, password) = (form["username"], form["password"]);
+        return new LoginInput(username!, password!);
+    }
+}
+
+record RegisterInput(string Name, string Password, string ConfirmPassword)
+{
+    public static RegisterInput From(IFormCollection form)
+    {
+        var (username, password, confirmPassword) = (form["username"], form["password"], form["confirmPassword"]);
+        return new RegisterInput(username!, password!, confirmPassword!);
+    }
+}
+
 class PageInputValidator : AbstractValidator<PageInput>
 {
     public PageInputValidator(string pageName, string homePageName)
@@ -808,5 +1156,43 @@ class PageInputValidator : AbstractValidator<PageInput>
             RuleFor(x => x.Name).Must(name => name.Equals(homePageName)).WithMessage($"You cannot modify home page name. Please keep it {homePageName}");
 
         RuleFor(x => x.Content).NotEmpty().WithMessage("Content is required");
+    }
+}
+
+class LoginInputValidator : AbstractValidator<LoginInput>
+{
+    public LoginInputValidator()
+    {
+        RuleFor(x => x.Name).NotEmpty().WithMessage("Username is required");
+
+        RuleFor(x => x.Password)
+            .NotEmpty()
+            .WithMessage("Password is required")
+            .MinimumLength(8)
+            .WithMessage("Password must be at least 8 characters long");
+    }
+}
+
+class RegisterInputValidator : AbstractValidator<RegisterInput>
+{
+    public RegisterInputValidator()
+    {
+        RuleFor(x => x.Name).NotEmpty().WithMessage("Username is required");
+
+        RuleFor(x => x.Password)
+            .Cascade(CascadeMode.Stop)
+            .NotEmpty()
+            .WithMessage("Password is required")
+            .MinimumLength(8)
+            .WithMessage("Password must be at least 8 characters long");
+
+        RuleFor(x => x.ConfirmPassword)
+            .NotEmpty()
+            .WithMessage("Confirm Password is required");
+
+        RuleFor(x => x)
+            .Must(x => x.Password == x.ConfirmPassword)
+            .WithMessage("Passwords do not match")
+            .When(x => !string.IsNullOrEmpty(x.Password) && !string.IsNullOrEmpty(x.ConfirmPassword));
     }
 }
