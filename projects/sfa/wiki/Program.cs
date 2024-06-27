@@ -178,13 +178,21 @@ app.MapGet("/{pageName}", (string pageName, HttpContext context, Wiki wiki, Rend
     }
     else
     {
-        return Results.Text(render.BuildEditorPage(pageName,
-        atBody: () =>
-          new[]
-          {
-            BuildForm(new PageInput(null, pageName, string.Empty, null), path: pageName, antiForgery: antiForgery.GetAndStoreTokens(context))
-          },
-        atSidePanel: () => AllPagesForEditing(wiki)).ToString(), HtmlMime);
+        if (isLogged)
+        {
+            return Results.Text(render.BuildEditorPage(pageName,
+            atBody: () =>
+              new[]
+              {
+                BuildForm(new PageInput(null, pageName, string.Empty, null), path: pageName, antiForgery: antiForgery.GetAndStoreTokens(context))
+              },
+            atSidePanel: () => AllPagesForEditing(wiki)).ToString(), HtmlMime);
+        }
+        else
+        {
+            return Results.Redirect("/auth/login");
+        }
+        
     }
 });
 
@@ -600,6 +608,16 @@ static string BuildAuthForm(bool isLogin, AntiforgeryTokenSet antiForgery, Model
         .Append(Input.Text.Class("uk-input").Name("confirmPassword").Attribute("placeholder ", "Confirm Password").Attribute("type", "password").Value(confirmPassword))
       );
 
+    var toLoginLink = Div
+        .Style("margin-top", "8px")
+        .Append("already Registered? ")
+        .Append(A.Class("to-login-btn").Append("Login").Href("/auth/login"));
+
+    var toRegisterLink = Div
+        .Style("margin-top", "8px")
+        .Append("Don't have an account? ")
+        .Append(A.Class("to-login-btn").Append("Register").Href("/auth/register"));
+
     var problemMessage = Div.Class("uk-form-danger uk-text-small").Append(err);
 
     if (modelState is object && !modelState.IsValid)
@@ -640,8 +658,9 @@ static string BuildAuthForm(bool isLogin, AntiforgeryTokenSet antiForgery, Model
                  .Append(antiForgeryField)
                  .Append(nameField)
                  .Append(passwordField)
-                 .Append(submit)
-                 .Append(problemMessage);
+                 .Append(toRegisterLink)
+                 .Append(problemMessage)
+                 .Append(submit);          
         return form.ToHtmlString();
     }
     else
@@ -656,8 +675,9 @@ static string BuildAuthForm(bool isLogin, AntiforgeryTokenSet antiForgery, Model
              .Append(nameField)
              .Append(passwordField)
              .Append(confirmPasswordField)
-             .Append(submit)
-             .Append(problemMessage);
+             .Append(toLoginLink)
+             .Append(problemMessage)
+             .Append(submit);
         return form.ToHtmlString();
     }
 
@@ -731,6 +751,17 @@ class Render
             max-width: 90%;
             padding: 1rem;
             box-shadow: 0 8px 16px 0 rgba(0,0,0,0.3);
+          }
+          .to-login-btn, .to-register-btn{
+              border: none;
+              background-color: transparent;
+              padding: 0;
+              color: rgb(13, 110, 253);
+              text-decoration: none;
+          }
+
+          .to-login-btn:hover, .to-register-btn:hover{
+              text-decoration: underline;
           }
           </style>
           """),

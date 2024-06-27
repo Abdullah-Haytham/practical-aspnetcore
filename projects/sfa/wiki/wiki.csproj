@@ -13,6 +13,6 @@
     <PackageReference Include="FluentValidation.AspNetCore" Version="11.3.0" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="wwwroot\styles.css" />
+    <Folder Include="wwwroot\" />
   </ItemGroup>
 </Project>
